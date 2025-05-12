@@ -1,0 +1,5 @@
+# torch==2.4.1+cu121: https://pytorch.org/get-started/locally/
+accelerate diffusers[torch]
+git+https://github.com/huggingface/transformers
+git+https://github.com/casper-hansen/AutoAWQ
+qwen-vl-utils[decord]
