@@ -1,0 +1,79 @@
+import cv2
+import numpy as np
+import supervision as sv
+import torch
+import torchvision
+from supervision.detection.utils import mask_to_xyxy
+
+from .sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+from .sam2.build_sam import build_sam2
+from .sam2.sam2_image_predictor import SAM2ImagePredictor
+from .utils import detection_labels
+
+
+class SegmentAnythingV2:
+    """ https://github.com/facebookresearch/sam2
+        :param encoder: Encoder type (tiny, small, base_plus, large)"""
+    anno_mask = sv.MaskAnnotator(color_lookup=sv.ColorLookup.INDEX, opacity=0.7)
+    anno_box = sv.BoxAnnotator(color_lookup=sv.ColorLookup.INDEX)
+    anno_label = sv.LabelAnnotator(color_lookup=sv.ColorLookup.INDEX, smart_position=True)
+
+    def __init__(self, encoder):
+        encoder_type = {"tiny": "t", "small": "s", "base_plus": "b+", "large": "l"}
+        assert encoder in encoder_type
+
+        checkpoint = f"checkpoints/sam2.1_hiera_{encoder}.pt"
+        model_cfg = f"configs/sam2.1/sam2.1_hiera_{encoder_type[encoder]}.yaml"
+
+        sam2 = build_sam2(model_cfg, checkpoint)
+        self.predictor = SAM2ImagePredictor(sam2)
+        # self.video_predictor = build_sam2_video_predictor(model_cfg, checkpoint)
+        self.auto_predictor = SAM2AutomaticMaskGenerator(sam2)
+
+    def __call__(self,
+                 image: np.ndarray,
+                 **kwargs) -> sv.Detections:
+        """ :param kwargs: use `prompt mode` if keyword parameters are provided, otherwise use `automatic mode` """
+        if kwargs:
+            self.predictor.set_image(image)
+            masks, scores, _ = self.predictor.predict(**kwargs, return_logits=False, multimask_output=False)
+            if masks.ndim > 3:
+                masks = masks.reshape(-1, *masks.shape[-2:])
+                scores = scores.reshape(-1)
+            return sv.Detections(xyxy=mask_to_xyxy(masks), mask=masks.astype(np.bool_), confidence=scores)
+        else:
+            ret = self.auto_predictor.generate(image)
+            return sv.Detections(
+                xyxy=torchvision.ops.box_convert(torch.tensor([r["bbox"] for r in ret]), in_fmt="xywh", out_fmt="xyxy").numpy(),
+                mask=np.stack([r["segmentation"] for r in ret]),
+                confidence=np.array([r["predicted_iou"] for r in ret])
+            )
+
+    @classmethod
+    def annotate(cls,
+                 image: np.ndarray,
+                 detections: sv.Detections) -> np.ndarray:
+        return cls.anno_label.annotate(
+            cls.anno_box.annotate(
+                cls.anno_mask.annotate(image.copy(), detections=detections), detections=detections),
+            detections=detections, labels=detection_labels(detections)
+        )
+
+
+if __name__ == '__main__':
+    sam2 = SegmentAnythingV2("large")
+
+    image = cv2.imread("assets/color.png")
+    point = np.array([[310, 160]])
+
+    # TODO: batch inference
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        dets = sam2(image,
+                    point_coords=point,
+                    point_labels=np.ones(len(point), dtype=np.bool_))
+        print(dets)
+        cv2.imwrite("runs/sam2.png", sam2.annotate(image, dets))
+
+        dets = sam2(image)
+        print(dets)
+        cv2.imwrite("runs/sam2_all.png", sam2.annotate(image, dets))
