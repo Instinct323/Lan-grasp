@@ -48,9 +48,11 @@ def mesh_points(w, h, stride):
 
 
 class Gripper:
-    vlm_ret_parts = ["<grasping part, i.e., word or phrase>",
-                     "<bbox, e.g., [top-left, top-right, bottom-left, bottom-right]>",
-                     "<reason, i.e., why you choose this part>"]
+    vlm_ret_parts = [
+        "<reason, i.e., why you choose this part>",
+        "<grasping part, i.e., word or phrase>",
+        "<bbox, e.g., [top-left, top-right, bottom-left, bottom-right]>",
+    ]
     vlm_ret_separator = " | "
 
     def __init__(self,
@@ -91,7 +93,7 @@ class Gripper:
 
 
 if __name__ == '__main__':
-    gripper = Gripper("http://127.0.0.1:8000")
+    gripper = Gripper("http://10.16.95.165:8000")
 
     img = cv2.imread("assets/cup.jpeg")
     gripper.process(img, "cup", "pick up")

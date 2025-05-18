@@ -8,5 +8,5 @@ pyrealsense2
 pyyaml
 scikit-learn
 seaborn
-timm
+supervision
 tqdm
