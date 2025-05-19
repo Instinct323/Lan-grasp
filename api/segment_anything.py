@@ -3,12 +3,11 @@ import numpy as np
 import supervision as sv
 import torch
 import torchvision
-from supervision.detection.utils import mask_to_xyxy
 
 from .sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 from .sam2.build_sam import build_sam2
 from .sam2.sam2_image_predictor import SAM2ImagePredictor
-from .utils import detection_labels
+from .utils import sv_annotate
 
 
 class SegmentAnythingV2:
@@ -40,7 +39,7 @@ class SegmentAnythingV2:
             if masks.ndim > 3:
                 masks = masks.reshape(-1, *masks.shape[-2:])
                 scores = scores.reshape(-1)
-            return sv.Detections(xyxy=mask_to_xyxy(masks), mask=masks.astype(np.bool_), confidence=scores)
+            return sv.Detections(xyxy=sv.mask_to_xyxy(masks), mask=masks.astype(np.bool_), confidence=scores)
         else:
             ret = self.auto_predictor.generate(image)
             return sv.Detections(
@@ -49,19 +48,12 @@ class SegmentAnythingV2:
                 confidence=np.array([r["predicted_iou"] for r in ret])
             )
 
-    @classmethod
-    def annotate(cls,
-                 image: np.ndarray,
-                 detections: sv.Detections) -> np.ndarray:
-        return cls.anno_label.annotate(
-            cls.anno_box.annotate(
-                cls.anno_mask.annotate(image.copy(), detections=detections), detections=detections),
-            detections=detections, labels=detection_labels(detections)
-        )
-
 
 if __name__ == '__main__':
-    sam2 = SegmentAnythingV2("large")
+    from utils.realsense import rgbd_flow
+    import matplotlib.pyplot as plt
+
+    sam2 = SegmentAnythingV2("tiny")
 
     image = cv2.imread("assets/color.png")
     point = np.array([[310, 160]])
@@ -72,8 +64,10 @@ if __name__ == '__main__':
                     point_coords=point,
                     point_labels=np.ones(len(point), dtype=np.bool_))
         print(dets)
-        cv2.imwrite("runs/sam2.png", sam2.annotate(image, dets))
+        cv2.imwrite("runs/sam2.png", sv_annotate(image, dets))
 
-        dets = sam2(image)
-        print(dets)
-        cv2.imwrite("runs/sam2_all.png", sam2.annotate(image, dets))
+    for c, d in rgbd_flow(640, 480, show=False):
+        dets = sam2(c)
+        print(dets.confidence)
+        plt.imshow(sv_annotate(c, dets))
+        plt.pause(1e-3)

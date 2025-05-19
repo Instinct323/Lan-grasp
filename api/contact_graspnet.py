@@ -13,7 +13,6 @@ class ContactGraspNet:
 
     def __init__(self,
                  ckpt_dir: Path = Path("checkpoints/contact_graspnet")):
-        print(ckpt_dir.resolve())
         self.estimator = GraspEstimator(config_utils.load_config(ckpt_dir, batch_size=1))
         CheckpointIO(checkpoint_dir=ckpt_dir / "checkpoints", model=self.estimator.model).load('model.pt')
 

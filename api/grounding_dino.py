@@ -2,10 +2,9 @@ import warnings
 
 import cv2
 import numpy as np
-import requests
 import supervision as sv
 
-from .utils import detection_labels
+from .utils import sv_annotate
 
 warnings.filterwarnings("ignore")
 
@@ -22,10 +21,9 @@ class GroundingDINO:
                  text_thresh: float = 0.25,
                  nms_iou: float = 0.5,
                  boxarea_thresh: float = 0.7):
-        # Check connection
-        assert requests.get("https://huggingface.co", timeout=5).status_code == 200
-        from groundingdino.config import GroundingDINO_SwinT_OGC as config
-        self.model = inference.Model(config.__file__, "checkpoints/groundingdino_swint_ogc.pth")
+        # Require to connect to Huggingface
+        # from groundingdino.config import GroundingDINO_SwinT_OGC as config
+        self.model = inference.Model("checkpoints/GroundingDINO_SwinT_OGC.py", "checkpoints/groundingdino_swint_ogc.pth")
         self.box_thresh = box_thresh
         self.text_thresh = text_thresh
         self.nms_iou = nms_iou
@@ -35,7 +33,7 @@ class GroundingDINO:
                  image: np.ndarray,
                  caption: str) -> sv.Detections:
         """ Open-vocabulary object detection
-            :param image: PIL image
+            :param image: OpenCV image
             :param caption: text prompt """
         dets, phrases = self.model.predict_with_caption(
             image, caption,
@@ -49,15 +47,6 @@ class GroundingDINO:
         if self.nms_iou: dets = dets.with_nms(self.nms_iou)
         return dets
 
-    @classmethod
-    def annotate(cls,
-                 image: np.ndarray,
-                 detections: sv.Detections) -> np.ndarray:
-        return cls.anno_label.annotate(
-            cls.anno_box.annotate(image.copy(), detections=detections),
-            detections=detections, labels=detection_labels(detections)
-        )
-
 
 if __name__ == "__main__":
     gdino = GroundingDINO()
@@ -66,4 +55,4 @@ if __name__ == "__main__":
 
     dets = gdino(image, "computer. jar. cup")
     print(dets)
-    cv2.imwrite("runs/gdino.jpg", gdino.annotate(image, dets))
+    cv2.imwrite("runs/gdino.jpg", sv_annotate(image, dets))
