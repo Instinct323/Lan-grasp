@@ -18,6 +18,27 @@ class JSONprompter(dict):
         return json.loads(response[7:-3] if as_code_block else response)
 
 
+class PatchAnnotator:
+
+    def __init__(self,
+                 n_patches: int,
+                 patch_size: int):
+        self.n_patches = n_patches
+        self.patch_size = patch_size
+        LOGGER.info(f"The image will be resized to {np.sqrt(n_patches) * patch_size:.0f}^2 pixels.")
+
+    def __call__(self,
+                 image: np.ndarray):
+        h, w = image.shape[:2]
+        nh = round(np.sqrt(self.n_patches / h * w))
+        nv = round(np.sqrt(self.n_patches * h / w))
+        image = cv2.resize(image, (nh * self.patch_size, nv * self.patch_size))
+
+        pts = np.mgrid[self.patch_size // 2: image.shape[1]: self.patch_size,
+              self.patch_size // 2: image.shape[0]: self.patch_size].T.reshape(-1, 2)
+        return annotate_pts(image, pts), pts
+
+
 class Gripper:
 
     def __init__(self,
@@ -30,6 +51,7 @@ class Gripper:
             point="point ID",
             reason="i.e., a sentence",
         )
+        self.patch_anno = PatchAnnotator(50, 14 * 2)
 
     def grouding_obj(self,
                      bgr: np.ndarray,
@@ -40,9 +62,10 @@ class Gripper:
         LOGGER.info("Confidence: " + str(dets.confidence))
         bbox = dets.xyxy[0]
         # Scale the bounding box
-        pad = padding * (bbox[2:] - bbox[:2])
-        bbox[:2] = np.maximum(bbox[:2] - pad, 0)
-        bbox[2:] = np.minimum(bbox[2:] + pad, bgr.shape[1::-1])
+        if padding > 0:
+            pad = padding * (bbox[2:] - bbox[:2])
+            bbox[:2] = np.maximum(bbox[:2] - pad, 0)
+            bbox[2:] = np.minimum(bbox[2:] + pad, bgr.shape[1::-1])
         return bbox
 
     def process(self,
@@ -54,11 +77,10 @@ class Gripper:
             :param task: task name """
         bgr = sv.resize_image(bgr, [self.img_size] * 2, keep_aspect_ratio=True)
         # Grouding the object
-        bbox = self.grouding_obj(bgr, obj, 0.15)
+        bbox = self.grouding_obj(bgr, obj, 0.1)
         bgr_obj = sv.crop_image(bgr, bbox)
         # Annotate the image
-        pts = sample_pts(*bgr_obj.shape[1::-1], 50)
-        bgr_obj_ann = annotate_pts(bgr_obj, pts)
+        bgr_obj_ann, pts = self.patch_anno(bgr_obj)
         # Obtain the gripping area
         prompt = (
                 f"You are an intelligent robotic arm. "
@@ -77,5 +99,5 @@ class Gripper:
 if __name__ == '__main__':
     gripper = Gripper("http://127.0.0.1:8000")
 
-    img = cv2.imread("assets/cup.jpeg")
+    img = cv2.imread("assets/cup.jpg")
     gripper.process(img, "glass", "pick up")
