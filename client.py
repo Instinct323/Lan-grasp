@@ -1,10 +1,9 @@
 import json
 
-import cv2
 import matplotlib.pyplot as plt
 from PIL import Image
 
-from utils import *
+from toolkit.client_utils import *
 
 
 class JSONprompter(dict):

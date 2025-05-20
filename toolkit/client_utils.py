@@ -3,9 +3,9 @@ import logging
 import pickle
 import time
 
+import cv2
 import numpy as np
 import requests
-import cv2
 import supervision as sv
 
 logging.basicConfig(format="[%(levelname)s] %(message)s", level=logging.INFO)

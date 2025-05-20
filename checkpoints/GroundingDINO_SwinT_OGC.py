@@ -1,4 +1,16 @@
-from utils import huggingface_model_path
+import os
+from pathlib import Path
+
+
+def huggingface_model_path(repo_id: str) -> str:
+    """ Download the model from Hugging Face. """
+    path = Path(f"~/.cache/huggingface/hub/models--{repo_id.replace('/', '--')}/snapshots").expanduser()
+    if not path.exists():
+        print("Downloading model from Hugging Face...")
+        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        os.system(f"huggingface-cli download {repo_id}")
+    return str(next(path.iterdir()))
+
 
 batch_size = 1
 modelname = "groundingdino"
