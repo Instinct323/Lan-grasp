@@ -1,12 +1,7 @@
 # python==3.10.16
-jupyter
 matplotlib
 numpy<2
 opencv-python
-open3d
-pyrealsense2
 pyyaml
-scikit-learn
-seaborn
 supervision
 tqdm
