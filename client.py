@@ -20,8 +20,11 @@ class JSONprompter(dict):
 
     def decode(self,
                response: str):
-        content = re.search(r"\{.*\}", response, flags=re.S)
-        return json.loads(content.group(0))
+        content = re.search(r"\{.*}", response, flags=re.S)
+        try:
+            return json.loads(content.group(0))
+        except:
+            raise ValueError(f"Invalid JSON response: {response}")
 
 
 class GridAnnotator:
@@ -53,7 +56,7 @@ class GridAnnotator:
     def get_box(self,
                 grid_info: dict,
                 grid_id: int):
-        if grid_id >= grid_info["ngrid"]: return None
+        if grid_id >= grid_info["ngrid"] or grid_id < 0: return None
         nr, nc = grid_info["shape"]
         r, c = grid_id // nc, grid_id % nc
         rows, cols = grid_info["rows"], grid_info["cols"]
@@ -92,6 +95,7 @@ class Gripper:
                        bgr: np.ndarray,
                        depth: np.ndarray,
                        unproj: Callable):
+        # Async: Obtain the grasping area
         mask_grasp = self.fapi.executor.submit(self.grasp_area, bgr)
 
         # Unproject the depth map
@@ -115,7 +119,11 @@ class Gripper:
         dets_obj = self.fapi.invoke("GroundingDINO", bgr, caption=self.obj)
         LOGGER.info("Confidence: " + str(dets_obj.confidence))
         bbox_obj = np.round(dets_obj.xyxy[0]).astype(int)
+        r = (bbox_obj[2:] - bbox_obj[:2]) / bgr.shape[1::-1]
+        if max(r) > 0.98: return
         bgr_obj = sv.crop_image(bgr, bbox_obj[None])
+
+        # Async: Segment the object
         mask_obj = self.fapi.invoke_async("SAM2", bgr_obj, box=[[0, 0, *bgr_obj.shape[1::-1]]])
 
         # VLM reasoning
@@ -123,13 +131,12 @@ class Gripper:
         prompt = self.prompt % (grid["ngrid"], grid["ngrid"], grid["shape"])
         LOGGER.info("Prompt: " + prompt)
         vlm_ret = self.fapi.invoke("Qwen-VL", None, image=bgr_obj, text=prompt)
-        LOGGER.info("VLM response: " + vlm_ret)
         vlm_ret = self.json_prompter.decode(vlm_ret)
         LOGGER.info("JSON response: " + str(vlm_ret))
 
         # Obtain the grasping area
-        bbox_grasp = self.grid_anno.get_box(grid, vlm_ret["grid_id"])
-        if bbox_grasp is None: return LOGGER.error("No grasping area found.")
+        bbox_grasp = self.grid_anno.get_box(grid, vlm_ret.get("grid_id", -1))
+        if bbox_grasp is None: return
         mask_obj = mask_obj.result().mask[0]
         mask_grasp = sv.crop_image(mask_obj, bbox_grasp[None])
         mask_grasp = np.stack(np.where(mask_grasp)[::-1], axis=-1) + bbox_obj[:2] + bbox_grasp[:2]
