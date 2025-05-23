@@ -1,110 +1,157 @@
 import json
 import re
+from pathlib import Path
 
-import matplotlib.pyplot as plt
+import cv2
 
 import api
 from toolkit.client_utils import *
+from typing import Callable
+
+PROJECT = Path("runs")
+PROJECT.mkdir(exist_ok=True)
 
 
 class JSONprompter(dict):
 
     def prompt(self):
-        return ("Your response should be formatted as a JSON code block, without any additional text. "
+        return ("\nYour response should be formatted as a JSON code block, without any additional text. "
                 "The required fields are:\n" + "\n".join(f"- {k}: {v}" for k, v in self.items()))
 
     def decode(self,
                response: str):
-        content = re.search(r"```json(.*)```", response, flags=re.S)
-        return json.loads(content.group(1))
+        content = re.search(r"\{.*\}", response, flags=re.S)
+        return json.loads(content.group(0))
 
 
-class PointAnnotator:
+class GridAnnotator:
 
     def __init__(self,
-                 n_pts: int):
-        self.n_pts = n_pts
+                 n_grids: int):
+        self.n_grids = n_grids
 
-    def __call__(self,
-                 image: np.ndarray,
-                 mask: np.ndarray):
-        pts = np.stack(np.where(mask), axis=-1)
-        # pts = pts[np.random.choice(range(len(pts)), self.n_pts, replace=False)]
-        pts = farthest_point_sampling(pts, self.n_pts)[0]
-        return annotate_pts(image, pts), pts
+    def annotate(self,
+                 image: np.ndarray):
+        h, w = image.shape[:2]
+        nr = round(np.sqrt(self.n_grids / h * w))
+        nc = round(np.sqrt(self.n_grids * h / w))
+        rows = np.round(np.linspace(0, h - 1, nr + 1)).astype(int)
+        cols = np.round(np.linspace(0, w - 1, nc + 1)).astype(int)
+
+        color = (255,) * 3
+        thickness = max(1, round(min(h, w) * 5e-3))
+
+        image = image.copy()
+        for r in rows:
+            cv2.line(image, (0, r), (w, r), color, thickness)
+        for c in cols:
+            cv2.line(image, (c, 0), (c, h), color, thickness)
+
+        grid = dict(rows=rows, cols=cols, ngrid=nr * nc, shape=(nr, nc))
+        return image, grid
+
+    def get_box(self,
+                grid_info: dict,
+                grid_id: int):
+        if grid_id >= grid_info["ngrid"]: return None
+        nr, nc = grid_info["shape"]
+        r, c = grid_id // nc, grid_id % nc
+        rows, cols = grid_info["rows"], grid_info["cols"]
+        return np.array([cols[c], rows[r], cols[c + 1], rows[r + 1]])
 
 
 class Gripper:
+    """ :param obj: target object
+        :param task: task name
+        :param n_grids: number of grids for the object """
+    fapi = FunctionsAPI(functions=api.FUNCTIONS)
 
     def __init__(self,
-                 img_size: int = 512):
-        self.img_size = img_size
+                 obj: str,
+                 task: str,
+                 n_grids: int = 30):
+        self.obj = obj
+        self.task = task
+        self.grid_anno = GridAnnotator(n_grids)
+
         self.json_prompter = JSONprompter(
             grasping_part="A word or phrase describing the part to grasp.",
-            point="The point ID of the chosen part in the image.",
+            grid_id="The grid ID of the part to grasp.",
             reason="A sentence explaining why this part is the best choice for grasping.",
         )
-        self.pts_anno = PointAnnotator(30)
-
-    def grouding_obj(self,
-                     bgr: np.ndarray,
-                     obj: str):
-        """ :return: bounding box of the object in the image """
-        dets = api.invoke("GroundingDINO", bgr, caption=obj)
-        LOGGER.info("Confidence: " + str(dets.confidence))
-        return dets[0]
-
-    def process(self,
-                bgr: np.ndarray,
-                obj: str,
-                task: str):
-        """ :param bgr: observe image
-            :param obj: target object
-            :param task: task name """
-        bgr = sv.resize_image(bgr, [self.img_size] * 2, keep_aspect_ratio=True)
-        anno_mask = sv.MaskAnnotator(color_lookup=sv.ColorLookup.INDEX)
-        # Grouding the object
-        dets = api.invoke("GroundingDINO", bgr, caption=obj)
-        LOGGER.info("Confidence: " + str(dets.confidence))
-        dets = dets[0]
-        bgr_obj = sv.crop_image(bgr, sv.scale_boxes(dets.xyxy, 1.))
-
-        # Obtain the mask of the object
-        dets_obj = api.invoke("SAM2", bgr_obj, box=[[0, 0, *bgr_obj.shape[1::-1]]])
-        # Erode then dilate the mask
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        mask_obj = dets_obj.mask[0].astype(np.uint8)
-        mask_obj = cv2.erode(mask_obj, kernel, iterations=2)
-        mask_obj = cv2.dilate(mask_obj, kernel, iterations=2)
-        dets_obj.mask[0] = mask_obj.astype(np.bool_)
-
-        # anno_mask.annotate(bgr_obj, dets_obj)
-        # Annotate the image
-        bgr_obj_ann, pts = self.pts_anno(bgr_obj, dets_obj.mask[0])
-        # Obtain the grasping area
-        prompt = (
+        self.prompt = (
                 f"You are an intelligent robotic arm. "
-                f"If you want to {task} the {obj} in the image, which part makes the most sense to grasp? Name one part. "
+                f"If you want to {self.task} the {self.obj} in the image, which part makes the most sense to grasp? Name one part. "
+                f"Most tools will have a handle, and the handle is usually the best part to grasp. "
+                f"The image has been divided into %d grids, "
+                f"and the corresponding grid IDs are given by the array generated by `np.arange(%d).reshape(%s)`."
                 + self.json_prompter.prompt()
         )
+
+    def estimate_grasp(self,
+                       bgr: np.ndarray,
+                       depth: np.ndarray,
+                       unproj: Callable):
+        mask_grasp = self.fapi.executor.submit(self.grasp_area, bgr)
+
+        # Unproject the depth map
+        pcd_full = unproj(depth)    # [H, W, 3]
+        grasp_poses = self.fapi.invoke("ContactGraspNet", pcd_full.reshape(-1, 3))
+
+        # Unproject the mask
+        mask_grasp = mask_grasp.result()
+        if mask_grasp is None: return
+        pcd_mask = pcd_full[mask_grasp[:, 1], mask_grasp[:, 0]]     # [N, 3]
+
+        # TODO: Filter the grasping poses
+
+        return mask_grasp
+
+    def grasp_area(self,
+                   bgr: np.ndarray):
+        """ :param bgr: observe image
+            :return: grasping area """
+        # Grouding the object
+        dets_obj = self.fapi.invoke("GroundingDINO", bgr, caption=self.obj)
+        LOGGER.info("Confidence: " + str(dets_obj.confidence))
+        bbox_obj = np.round(dets_obj.xyxy[0]).astype(int)
+        bgr_obj = sv.crop_image(bgr, bbox_obj[None])
+        mask_obj = self.fapi.invoke_async("SAM2", bgr_obj, box=[[0, 0, *bgr_obj.shape[1::-1]]])
+
+        # VLM reasoning
+        bgr_obj, grid = self.grid_anno.annotate(bgr_obj)
+        prompt = self.prompt % (grid["ngrid"], grid["ngrid"], grid["shape"])
         LOGGER.info("Prompt: " + prompt)
-        vlm_ret = api.invoke("Qwen-VL", None, image=bgr_obj_ann, text=prompt)
+        vlm_ret = self.fapi.invoke("Qwen-VL", None, image=bgr_obj, text=prompt)
         LOGGER.info("VLM response: " + vlm_ret)
         vlm_ret = self.json_prompter.decode(vlm_ret)
         LOGGER.info("JSON response: " + str(vlm_ret))
 
-        # Extract the grasping part
-        pt_id = int(vlm_ret["point"])
-        dets_obj = api.invoke("SAM2", bgr_obj_ann, point_coords=[pts[pt_id]], point_labels=[1])
-        print(dets_obj.area)
-        anno_mask.annotate(bgr_obj_ann, dets_obj)
+        # Obtain the grasping area
+        bbox_grasp = self.grid_anno.get_box(grid, vlm_ret["grid_id"])
+        if bbox_grasp is None: return LOGGER.error("No grasping area found.")
+        mask_obj = mask_obj.result().mask[0]
+        mask_grasp = sv.crop_image(mask_obj, bbox_grasp[None])
+        mask_grasp = np.stack(np.where(mask_grasp)[::-1], axis=-1) + bbox_obj[:2] + bbox_grasp[:2]
+        bbox_grasp = sv.move_boxes(bbox_grasp, bbox_obj[:2])
 
-        plt.imshow(bgr_obj_ann[..., ::-1])
-        plt.show()
+        # Visualize the results
+        dets_grasp = np.zeros(bgr.shape[:2], dtype=np.bool_)
+        dets_grasp[mask_grasp[:, 1], mask_grasp[:, 0]] = True
+        dets_grasp = sv.Detections(xyxy=bbox_grasp[None], mask=dets_grasp[None])
+        bgr = bgr.copy()
+        bgr[bbox_obj[1]: bbox_obj[3], bbox_obj[0]: bbox_obj[2]] = bgr_obj
+        bgr = sv_annotate(bgr, dets_grasp)
+        cv2.imwrite(str(PROJECT / f"{self.task}-{self.obj}.jpg"), bgr)
+        return mask_grasp
 
 
 if __name__ == '__main__':
-    gripper = Gripper()
+    gripper = Gripper("glass", "drink")
+    # camera = Pinhole()
 
-    img = cv2.imread("assets/cup.jpg")
-    gripper.process(img, "glass", "pick up")
+    img = cv2.imread("assets/glass.jpeg")
+    img = sv.resize_image(img, [640] * 2, keep_aspect_ratio=True)
+
+    output = gripper.grasp_area(img)
+    print(output.shape)

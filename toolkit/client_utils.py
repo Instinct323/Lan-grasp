@@ -2,9 +2,7 @@ import concurrent.futures
 import logging
 import pickle
 import time
-from typing import Union
 
-import cv2
 import numpy as np
 import requests
 import supervision as sv
@@ -13,48 +11,40 @@ logging.basicConfig(format="[%(levelname)s] %(message)s", level=logging.INFO)
 LOGGER = logging.getLogger("utils")
 
 
-def annotate_pts(bgr, pts):
-    size_min = min(bgr.shape[1::-1])
-    pt_size = max(1, round(0.01 * size_min))
-    font_scale = 0.002 * size_min
+class Pinhole:
 
-    bgr = bgr.copy()
-    for i, pt in enumerate(pts.tolist()):
-        bgr = cv2.circle(bgr, pt, pt_size, (0, 255, 0), -1)
-        bgr = cv2.putText(bgr, str(i), pt, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), 1)
-    return bgr
+    def __init__(self, w, h, fx, fy, cx, cy):
+        self.size = w, h
+        self.intrinsic = np.array([fx, fy, cx, cy])
+        # cache for unprojection
+        self.__coords = np.stack(np.meshgrid(np.arange(w), np.arange(h)), axis=-1)
+        self.__unproj = (self.__coords - [cx, cy]) / [fx, fy]
 
-
-def farthest_point_sampling(pts: np.ndarray,
-                            num_samples: Union[int, float]):
-    """ Farthest Point Sampling (FPS) algorithm.
-        :param pts: The input point cloud.
-        :param num_samples: The number of points to sample.
-        :return: The sampled points and their indices."""
-    n = len(pts)
-    if isinstance(num_samples, float): num_samples = int(num_samples * n)
-    if num_samples > n: return pts, None
-
-    distances = np.full(n, np.inf)
-    indices = np.zeros(num_samples, dtype=int)
-    indices[0] = np.random.randint(0, n)
-
-    for i in range(num_samples - 1):
-        distances = np.minimum(distances, np.linalg.norm(pts - pts[indices[i]], axis=1))
-        indices[i + 1] = np.argmax(distances)
-
-    return pts[indices], indices
+    def unproj(self,
+               depth: np.ndarray):
+        assert depth.ndim == 2, f"Depth map should be 2D, but got {depth.ndim}D"
+        pcd = np.repeat(depth[..., None], 3, axis=-1)
+        pcd[..., :2] *= self.__unproj
+        return pcd
 
 
 class FunctionsAPI:
 
-    def __init__(self, url):
+    def __init__(self,
+                 url: str = None,
+                 functions: dict = None):
         self.url = url
+        self.functions = functions
         self.executor = concurrent.futures.ThreadPoolExecutor()
-        assert requests.get(f"{self.url}/docs").status_code == 200
-        LOGGER.info(f"See {self.url}/docs for API documentation.")
+
+        assert self.url or self.functions, "Please provide either a URL or a function dictionary."
+        if self.url:
+            assert requests.get(f"{self.url}/docs").status_code == 200
+            LOGGER.info(f"See {self.url}/docs for API documentation.")
 
     def invoke(self, func, *args, **kwargs):
+        if self.functions: return self.functions[func](*args, **kwargs)
+
         data = {"func": func, "args": args, "kwargs": kwargs}
         response = requests.post(f"{self.url}/invoke", data=pickle.dumps(data), headers={"t-send": str(int(time.time()))})
         assert response.status_code == 200, f"{response.status_code}, {response.text}"

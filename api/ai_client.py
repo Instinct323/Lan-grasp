@@ -4,7 +4,7 @@ from functools import partial
 import cv2
 import openai
 
-from utils import ContentMaker
+from .utils import ContentMaker
 
 
 class AIclient:
