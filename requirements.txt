@@ -1,6 +1,7 @@
 # python==3.10.16
 matplotlib
 numpy<2
+openai
 opencv-python
 pyyaml
 supervision

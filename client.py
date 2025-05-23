@@ -1,88 +1,33 @@
-import json
-import re
 from pathlib import Path
-
-import cv2
+from typing import Callable
 
 import api
 from toolkit.client_utils import *
-from typing import Callable
 
 PROJECT = Path("runs")
 PROJECT.mkdir(exist_ok=True)
 
 
-class JSONprompter(dict):
-
-    def prompt(self):
-        return ("\nYour response should be formatted as a JSON code block, without any additional text. "
-                "The required fields are:\n" + "\n".join(f"- {k}: {v}" for k, v in self.items()))
-
-    def decode(self,
-               response: str):
-        content = re.search(r"\{.*}", response, flags=re.S)
-        try:
-            return json.loads(content.group(0))
-        except:
-            raise ValueError(f"Invalid JSON response: {response}")
-
-
-class GridAnnotator:
-
-    def __init__(self,
-                 n_grids: int):
-        self.n_grids = n_grids
-
-    def annotate(self,
-                 image: np.ndarray):
-        h, w = image.shape[:2]
-        nr = round(np.sqrt(self.n_grids / h * w))
-        nc = round(np.sqrt(self.n_grids * h / w))
-        rows = np.round(np.linspace(0, h - 1, nr + 1)).astype(int)
-        cols = np.round(np.linspace(0, w - 1, nc + 1)).astype(int)
-
-        color = (255,) * 3
-        thickness = max(1, round(min(h, w) * 5e-3))
-
-        image = image.copy()
-        for r in rows:
-            cv2.line(image, (0, r), (w, r), color, thickness)
-        for c in cols:
-            cv2.line(image, (c, 0), (c, h), color, thickness)
-
-        grid = dict(rows=rows, cols=cols, ngrid=nr * nc, shape=(nr, nc))
-        return image, grid
-
-    def get_box(self,
-                grid_info: dict,
-                grid_id: int):
-        if grid_id >= grid_info["ngrid"] or grid_id < 0: return None
-        nr, nc = grid_info["shape"]
-        r, c = grid_id // nc, grid_id % nc
-        rows, cols = grid_info["rows"], grid_info["cols"]
-        return np.array([cols[c], rows[r], cols[c + 1], rows[r + 1]])
-
-
 class Gripper:
     """ :param obj: target object
         :param task: task name
-        :param n_grids: number of grids for the object """
+        :param ngrid: number of grids for the object """
     fapi = FunctionsAPI(functions=api.FUNCTIONS)
 
     def __init__(self,
                  obj: str,
                  task: str,
-                 n_grids: int = 30):
+                 ngrid: int = 30):
         self.obj = obj
         self.task = task
-        self.grid_anno = GridAnnotator(n_grids)
+        self.grid_anno = GridAnnotator(ngrid)
 
         self.json_prompter = JSONprompter(
             grasping_part="A word or phrase describing the part to grasp.",
             grid_id="The grid ID of the part to grasp.",
             reason="A sentence explaining why this part is the best choice for grasping.",
         )
-        self.prompt = (
+        self.prompt_template = (
                 f"You are an intelligent robotic arm. "
                 f"If you want to {self.task} the {self.obj} in the image, which part makes the most sense to grasp? Name one part. "
                 f"Most tools will have a handle, and the handle is usually the best part to grasp. "
@@ -99,15 +44,17 @@ class Gripper:
         mask_grasp = self.fapi.executor.submit(self.grasp_area, bgr)
 
         # Unproject the depth map
-        pcd_full = unproj(depth)    # [H, W, 3]
+        pcd_full = unproj(depth)  # [H, W, 3]
         grasp_poses = self.fapi.invoke("ContactGraspNet", pcd_full.reshape(-1, 3))
 
         # Unproject the mask
         mask_grasp = mask_grasp.result()
         if mask_grasp is None: return
-        pcd_mask = pcd_full[mask_grasp[:, 1], mask_grasp[:, 0]]     # [N, 3]
+        pcd_mask = pcd_full[mask_grasp[:, 1], mask_grasp[:, 0]]  # [N, 3]
+        # TODO: Outlier removal
 
         # TODO: Filter the grasping poses
+        pcd_mask_bound = np.stack([pcd_mask.min(axis=0), pcd_mask.max(axis=0)], axis=0)
 
         return mask_grasp
 
@@ -115,28 +62,37 @@ class Gripper:
                    bgr: np.ndarray):
         """ :param bgr: observe image
             :return: grasping area """
+
         # Grouding the object
         dets_obj = self.fapi.invoke("GroundingDINO", bgr, caption=self.obj)
-        LOGGER.info("Confidence: " + str(dets_obj.confidence))
+        if not dets_obj:
+            LOGGER.error(f"Failed to detect \"{self.obj}\"")
+            return
+        LOGGER.info("GroudingDINO confidence: " + str(dets_obj.confidence))
         bbox_obj = np.round(dets_obj.xyxy[0]).astype(int)
         r = (bbox_obj[2:] - bbox_obj[:2]) / bgr.shape[1::-1]
-        if max(r) > 0.98: return
+        if max(r) > 0.98:
+            LOGGER.warning("Too close to the object, skip grasping area estimation.")
+            return
         bgr_obj = sv.crop_image(bgr, bbox_obj[None])
 
         # Async: Segment the object
         mask_obj = self.fapi.invoke_async("SAM2", bgr_obj, box=[[0, 0, *bgr_obj.shape[1::-1]]])
 
         # VLM reasoning
-        bgr_obj, grid = self.grid_anno.annotate(bgr_obj)
-        prompt = self.prompt % (grid["ngrid"], grid["ngrid"], grid["shape"])
+        grid_info = self.grid_anno.make_grid(*bgr_obj.shape[1::-1])
+        bgr_obj = self.grid_anno.annotate(bgr_obj, grid_info)
+        prompt = self.prompt_template % (grid_info["ngrid"], grid_info["ngrid"], grid_info["shape"])
         LOGGER.info("Prompt: " + prompt)
         vlm_ret = self.fapi.invoke("Qwen-VL", None, image=bgr_obj, text=prompt)
         vlm_ret = self.json_prompter.decode(vlm_ret)
         LOGGER.info("JSON response: " + str(vlm_ret))
 
         # Obtain the grasping area
-        bbox_grasp = self.grid_anno.get_box(grid, vlm_ret.get("grid_id", -1))
-        if bbox_grasp is None: return
+        bbox_grasp = self.grid_anno.index_grid(vlm_ret.get("grid_id", -1), grid_info)
+        if bbox_grasp is None:
+            LOGGER.error("Invalid grid ID, please ensure the VLM is working correctly.")
+            return
         mask_obj = mask_obj.result().mask[0]
         mask_grasp = sv.crop_image(mask_obj, bbox_grasp[None])
         mask_grasp = np.stack(np.where(mask_grasp)[::-1], axis=-1) + bbox_obj[:2] + bbox_grasp[:2]
